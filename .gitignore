@@ -1,0 +1,12 @@
+# Virtual Environment Sandbox
+nexus-env/
+venv/
+.venv/
+ENV/
+
+# Secrets and Keys
+.env
+
+# Python caching files
+__pycache__/
+*.pyc

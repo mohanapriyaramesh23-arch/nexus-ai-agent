@@ -49,7 +49,13 @@ python test_setup.py
 
 ## Project Status
 
-🔨 Day 1 of 26 complete — environment fully set up and verified.
+## Project Status
+
+🔨 Day 2 of 26 complete.
+
+**Last completed:** document_loader.py built and tested — handles PDF and TXT loading via file path parameter, validates extension before checking file existence, raises clear errors, returns Document objects with metadata intact.
+
+**Next up:** Day 3 — chunker.py (RecursiveCharacterTextSplitter, chunk_size=1000, chunk_overlap=200)
 
 ---
 

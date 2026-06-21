@@ -10,3 +10,4 @@ ENV/
 # Python caching files
 __pycache__/
 *.pyc
+PROJECT_SPEC.md

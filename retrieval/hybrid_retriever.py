@@ -1,35 +1,41 @@
 from typing import List, Dict, Any
 from retrieval.vector_search import search_vector_store
 from retrieval.bm25_search import search_bm25
+from retrieval.reranker import rerank_candidates  # Import Stage 2 component
 
 def hybrid_search(query_text: str, collection_name: str = "nexus_documents", limit: int = 5) -> List[Dict[str, Any]]:
     """
-    Executes both vector similarity search and BM25 keyword search, unifies them
-    using Reciprocal Rank Fusion (RRF), and returns a single optimized list.
+    Executes a complete Two-Stage Retrieval Pipeline:
+    Stage 1: Gathers and blends documents using Vector Search, BM25 Search, and RRF.
+    Stage 2: Reranks the top candidate pool using a deep Cross-Encoder attention model.
     """
     # K constant buffer parameter (standard industry value to balance rank weights)
     K = 60
     
-    # 1. Gather results from both underlying retrieval mechanisms
-    # We retrieve slightly more items (limit * 2) to ensure a robust overlap pool for ranking
+    # ==========================================
+    # STAGE 1: HYBRID CANDIDATE GATHERING (RRF)
+    # ==========================================
+    
+    # Use a small multiplier safety factor for candidate pulling
+    candidate_limit = limit * 2
+    
     try:
-        vector_results = search_vector_store(query_text, collection_name=collection_name, limit=limit * 2)
+        vector_results = search_vector_store(query_text, collection_name=collection_name, limit=candidate_limit)
     except Exception:
         vector_results = []
         
     try:
-        bm25_results = search_bm25(query_text, collection_name=collection_name, limit=limit * 2)
+        bm25_results = search_bm25(query_text, collection_name=collection_name, limit=candidate_limit)
     except Exception:
         bm25_results = []
 
-    # 2. Track combined items and compute aggregate RRF scores
-    # We use chunk_text as our unique identifier string to cross-reference matches
+    # Track combined items and compute aggregate RRF scores
     rrf_scores = {}      # Maps chunk_text -> calculated float score
-    chunk_registry = {}  # Maps chunk_text -> original metadata and structural properties
+    chunk_registry = {}  # Maps chunk_text -> original metadata
 
     # Process Vector List
     for rank, match in enumerate(vector_results, 1):
-        text = match.get("chunk_text")
+        text = match.get("chunk_text") or match.get("text") or match.get("page_content")
         if not text:
             continue
             
@@ -41,7 +47,7 @@ def hybrid_search(query_text: str, collection_name: str = "nexus_documents", lim
 
     # Process BM25 List
     for rank, match in enumerate(bm25_results, 1):
-        text = match.get("chunk_text")
+        text = match.get("chunk_text") or match.get("text") or match.get("page_content")
         if not text:
             continue
             
@@ -51,21 +57,28 @@ def hybrid_search(query_text: str, collection_name: str = "nexus_documents", lim
             
         rrf_scores[text] += 1.0 / (rank + K)
 
-    # 3. If neither search returned any results, exit gracefully with an empty list
+    # If neither search returned any results, exit early gracefully
     if not rrf_scores:
         return []
 
-    # 4. Convert the mapped registry into a structured list of dictionaries
-    fused_results = []
+    # Convert the mapped registry into a structured candidates list
+    candidates = []
     for text, score in rrf_scores.items():
-        fused_results.append({
+        candidates.append({
             "chunk_text": text,
             "score": float(score),
             "metadata": chunk_registry[text]
         })
 
-    # 5. Sort the unified results so that highest RRF scores sit at the top
-    fused_results.sort(key=lambda x: x["score"], reverse=True)
+    # Pre-sort Stage 1 results by RRF score to prune down to an optimal shortlist
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    shortlist = candidates[:candidate_limit]
 
-    # Return up to the requested top limit
-    return fused_results[:limit]
+    # ==========================================
+    # STAGE 2: CROSS-ENCODER RERANKING
+    # ==========================================
+    print(f"[INFO] Passing {len(shortlist)} candidates to Stage 2 Cross-Encoder Reranker...")
+    reranked_results = rerank_candidates(query_text, shortlist)
+
+    # Return up to the requested top limit, now fully optimized
+    return reranked_results[:limit]

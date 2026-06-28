@@ -1,35 +1,23 @@
-from typing import TypedDict, List, Dict, Any
-from langgraph.graph import StateGraph, START, END
-from agent.nodes import analyze_query_node, retrieve_documents_node, generate_answer_node
+import os
+print("[GRAPH.PY] Starting graph.py compilation...")
+from langgraph.graph import StateGraph, END
+from agent.state import AgentState
+from agent.nodes import analyze_query_node, execute_tool_node, synthesize_response_node
 
-# Define our Shared State Object Structure
-class AgentState(TypedDict):
-    query: str                # The current user query
-    history: str              # Formatted history strings
-    chosen_sources: List[str] # List of chosen tool targets
-    retrieved_context: str    # Search results payload text
-    answer: str               # The finalized output string
+print("[GRAPH.PY] Initializing StateGraph workflow structure...")
+workflow = StateGraph(AgentState)
 
-def create_nexus_graph():
-    """
-    Assembles individual functional nodes into a coordinated StateGraph state machine.
-    """
-    # 1. Initialize the graph framework mapped onto our custom state structure
-    builder = StateGraph(AgentState)
-    
-    # 2. Register our concrete processing nodes
-    builder.add_node("query_analyzer", analyze_query_node)
-    builder.add_node("document_retriever", retrieve_documents_node)
-    builder.add_node("answer_generator", generate_answer_node)
-    
-    # 3. Construct direct operational execution paths (Edges)
-    builder.add_edge(START, "query_analyzer")
-    builder.add_edge("query_analyzer", "document_retriever")
-    builder.add_edge("document_retriever", "answer_generator")
-    builder.add_edge("answer_generator", END)
-    
-    # 4. Compile our structured graph map down into an executable binary state machine
-    return builder.compile()
+# Define our standardized architectural graph nodes
+workflow.add_node("tool_selector", analyze_query_node)
+workflow.add_node("execute_tools", execute_tool_node)
+workflow.add_node("synthesizer", synthesize_response_node)
 
-# Single access instance for our validation execution runner
-nexus_agent_executor = create_nexus_graph()
+# Construct the sequential execution links
+workflow.set_entry_point("tool_selector")
+workflow.add_edge("tool_selector", "execute_tools")
+workflow.add_edge("execute_tools", "synthesizer")
+workflow.add_edge("synthesizer", END)
+
+# Compile the final validated agent structure
+nexus_agent = workflow.compile()
+print("[GRAPH.PY] Day 15 multi-source graph compiled successfully!")

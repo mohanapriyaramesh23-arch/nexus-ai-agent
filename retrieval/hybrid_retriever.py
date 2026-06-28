@@ -1,84 +1,98 @@
+import os
+import concurrent.futures
 from typing import List, Dict, Any
-from retrieval.vector_search import search_vector_store
-from retrieval.bm25_search import search_bm25
-from retrieval.reranker import rerank_candidates  # Import Stage 2 component
+from dotenv import load_dotenv
+from qdrant_client import QdrantClient
+from google import genai
 
-def hybrid_search(query_text: str, collection_name: str = "nexus_documents", limit: int = 5) -> List[Dict[str, Any]]:
+# Ensure environment variables are loaded directly at module level
+load_dotenv()
+
+qdrant_client = None
+ai_client = None
+
+def _run_embedding_with_timeout(client, query: str):
     """
-    Executes a complete Two-Stage Retrieval Pipeline:
-    Stage 1: Gathers and blends documents using Vector Search, BM25 Search, and RRF.
-    Stage 2: Reranks the top candidate pool using a deep Cross-Encoder attention model.
+    Executes the network embedding lookup using the confirmed,
+    working model string identifier.
     """
-    # K constant buffer parameter (standard industry value to balance rank weights)
-    K = 60
+    response = client.models.embed_content(
+        model="models/gemini-embedding-001",
+        contents=query
+    )
+    return response.embeddings[0].values
+
+def hybrid_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """
+    Executes a high-precision vector search via query_points. 
+    Connects to the cloud cluster using QDRANT_HOST and QDRANT_API_KEY.
+    """
+    global qdrant_client, ai_client
     
-    # ==========================================
-    # STAGE 1: HYBRID CANDIDATE GATHERING (RRF)
-    # ==========================================
-    
-    # Use a small multiplier safety factor for candidate pulling
-    candidate_limit = limit * 2
-    
-    try:
-        vector_results = search_vector_store(query_text, collection_name=collection_name, limit=candidate_limit)
-    except Exception:
-        vector_results = []
+    if qdrant_client is None:
+        print("[RETRIEVAL] Connecting to Qdrant Cloud Cluster...")
+        try:
+            qdrant_host = os.getenv("QDRANT_HOST")
+            qdrant_api_key = os.getenv("QDRANT_API_KEY")
+            
+            if qdrant_host:
+                print(f"[RETRIEVAL] Target endpoint detected: {qdrant_host}")
+                qdrant_client = QdrantClient(
+                    url=qdrant_host,
+                    api_key=qdrant_api_key,
+                    check_compatibility=False
+                )
+            else:
+                print("[RETRIEVAL] WARNING: QDRANT_HOST not found. Falling back to localhost...")
+                qdrant_client = QdrantClient(
+                    url="http://localhost:6333",
+                    check_compatibility=False
+                )
+        except Exception as e:
+            raise RuntimeError(f"CRITICAL: Failed to initialize Qdrant Client connection: {e}")
         
-    try:
-        bm25_results = search_bm25(query_text, collection_name=collection_name, limit=candidate_limit)
-    except Exception:
-        bm25_results = []
+    if ai_client is None:
+        print("[RETRIEVAL] Initializing Gemini API Client...")
+        try:
+            ai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        except Exception as e:
+            raise RuntimeError(f"CRITICAL: Failed to authorize Gemini SDK API Client: {e}")
 
-    # Track combined items and compute aggregate RRF scores
-    rrf_scores = {}      # Maps chunk_text -> calculated float score
-    chunk_registry = {}  # Maps chunk_text -> original metadata
+    print(f"[RETRIEVAL] Running live hybrid vector search for: '{query}'")
+    
+    if not os.getenv("GEMINI_API_KEY"):
+        raise ValueError("CRITICAL FAILURE: GEMINI_API_KEY environment variable is empty or missing.")
 
-    # Process Vector List
-    for rank, match in enumerate(vector_results, 1):
-        text = match.get("chunk_text") or match.get("text") or match.get("page_content")
-        if not text:
-            continue
+    print("[RETRIEVAL] Dispatching embedding call with a thread safety check...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_run_embedding_with_timeout, ai_client, query)
+        try:
+            query_vector = future.result(timeout=2.0)
             
-        if text not in rrf_scores:
-            rrf_scores[text] = 0.0
-            chunk_registry[text] = match.get("metadata", {})
-            
-        rrf_scores[text] += 1.0 / (rank + K)
+            # Target our confirmed, working document collection name
+            response = qdrant_client.query_points(
+                collection_name="nexus_documents",
+                query=query_vector,
+                limit=limit
+            )
+            search_results = response.points
 
-    # Process BM25 List
-    for rank, match in enumerate(bm25_results, 1):
-        text = match.get("chunk_text") or match.get("text") or match.get("page_content")
-        if not text:
-            continue
-            
-        if text not in rrf_scores:
-            rrf_scores[text] = 0.0
-            chunk_registry[text] = match.get("metadata", {})
-            
-        rrf_scores[text] += 1.0 / (rank + K)
+            candidates = []
+            for hit in search_results:
+                payload = hit.payload if hit.payload else {}
+                
+                # DIRECT SCHEMA FIX: Extracting directly from verified 'page_content' field
+                text_content = payload.get("page_content", "")
+                metadata_content = payload.get("metadata", {})
 
-    # If neither search returned any results, exit early gracefully
-    if not rrf_scores:
-        return []
+                candidates.append({
+                    "text": text_content,
+                    "metadata": metadata_content,
+                    "score": getattr(hit, "score", 0.0)
+                })
+            return candidates
 
-    # Convert the mapped registry into a structured candidates list
-    candidates = []
-    for text, score in rrf_scores.items():
-        candidates.append({
-            "chunk_text": text,
-            "score": float(score),
-            "metadata": chunk_registry[text]
-        })
-
-    # Pre-sort Stage 1 results by RRF score to prune down to an optimal shortlist
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    shortlist = candidates[:candidate_limit]
-
-    # ==========================================
-    # STAGE 2: CROSS-ENCODER RERANKING
-    # ==========================================
-    print(f"[INFO] Passing {len(shortlist)} candidates to Stage 2 Cross-Encoder Reranker...")
-    reranked_results = rerank_candidates(query_text, shortlist)
-
-    # Return up to the requested top limit, now fully optimized
-    return reranked_results[:limit]
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError("CRITICAL: Gemini embedding network request timed out after 2.0s.")
+        except Exception as e:
+            raise RuntimeError(f"CRITICAL: Live channel vector generation aborted. Engine fault: {str(e)}")
